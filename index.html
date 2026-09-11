@@ -1742,20 +1742,32 @@ let STATE_SHA = null;
 function b64EncodeUnicode(str){ return btoa(unescape(encodeURIComponent(str))); }
 function b64DecodeUnicode(str){ return decodeURIComponent(escape(atob(str))); }
 
+// Si la carga inicial falla por algo que NO sea "todavía no existe el
+// archivo" (404, normal en un repo nuevo), se guarda aquí el motivo para
+// avisar en pantalla — así un problema real de conexión/permisos no queda
+// escondido como si simplemente no hubiera nada guardado todavía.
+let STATE_LOAD_ERROR = null;
+
 async function loadState(){
+  STATE_LOAD_ERROR = null;
   try{
     const res = await fetch(`${GH_API}?ref=${GH_BRANCH}`, {
       headers: { "Authorization": `Bearer ${GH_TOKEN}`, "Accept": "application/vnd.github+json" },
       cache: "no-store"
     });
     if (res.status === 404){ EDITS = {}; STATE_SHA = null; return; }
-    if (!res.ok) throw new Error("load failed: " + res.status);
+    if (!res.ok){
+      let detail = "";
+      try{ const j = await res.json(); detail = j && j.message ? j.message : ""; } catch(_e){}
+      throw new Error(res.status + (detail ? " — " + detail : ""));
+    }
     const json = await res.json();
     STATE_SHA = json.sha;
     const content = b64DecodeUnicode(json.content.replace(/\n/g, ""));
     EDITS = content ? JSON.parse(content) : {};
   } catch(e){
     console.warn("No se pudo cargar el estado guardado, se usa el contenido por defecto.", e);
+    STATE_LOAD_ERROR = (e && e.message) ? e.message : "error de red";
     EDITS = {};
   }
 }
@@ -1840,6 +1852,9 @@ function cancelEdits(){
 // Sube el estado a GitHub vía la Contents API. Si alguien más guardó a la
 // vez (conflicto de sha), recarga el estado real, fusiona por encima y
 // reintenta — hasta 2 veces — en vez de pisar lo que esa persona guardó.
+// Cualquier fallo (red, permisos, GitHub caído...) se relanza con el
+// código HTTP real y el mensaje que da GitHub, para poder diagnosticarlo
+// sin tener que abrir la consola del navegador.
 async function pushState(newEdits, attempt = 0){
   const body = {
     message: `Ruta Power — actualización ${new Date().toISOString()}`,
@@ -1847,24 +1862,39 @@ async function pushState(newEdits, attempt = 0){
     branch: GH_BRANCH
   };
   if (STATE_SHA) body.sha = STATE_SHA;
-  const res = await fetch(GH_API, {
-    method: "PUT",
-    headers: {
-      "Authorization": `Bearer ${GH_TOKEN}`,
-      "Accept": "application/vnd.github+json",
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
+  let res;
+  try{
+    res = await fetch(GH_API, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${GH_TOKEN}`,
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+  } catch(networkErr){
+    throw Object.assign(
+      new Error("No se pudo conectar con GitHub (" + (networkErr && networkErr.message ? networkErr.message : "error de red") + ")"),
+      { code: "network" }
+    );
+  }
   if (res.status === 409 || res.status === 422){
-    if (attempt >= 2) throw Object.assign(new Error("conflict"), { code: "conflict" });
+    if (attempt >= 2){
+      let detail = "";
+      try{ const j = await res.json(); detail = j && j.message ? j.message : ""; } catch(_e){}
+      throw Object.assign(new Error("conflicto persistente" + (detail ? " — " + detail : "")), { code: "conflict" });
+    }
     await loadState();
     const merged = Object.assign({}, EDITS, newEdits);
     return pushState(merged, attempt + 1);
   }
   if (!res.ok){
-    const err = new Error("save failed: " + res.status);
-    err.code = res.status === 403 ? "not_writer" : (res.status === 429 ? "rate_limited" : "unknown");
+    let detail = "";
+    try{ const j = await res.json(); detail = j && j.message ? j.message : ""; } catch(_e){}
+    const err = new Error(res.status + (detail ? " — " + detail : " — sin más detalle"));
+    err.code = res.status === 401 ? "unauthorized" : res.status === 403 ? "not_writer" : (res.status === 429 ? "rate_limited" : "unknown");
+    err.status = res.status;
     throw err;
   }
   const json = await res.json();
@@ -2004,7 +2034,7 @@ async function saveField(path, value){
     renderTeamAssign();
   } catch(err){
     console.error(err);
-    alert("No se pudo guardar la asignación. Prueba de nuevo en unos segundos.");
+    alert("No se pudo guardar: " + (err && err.message ? err.message : "error desconocido") + "\n\nHaz una captura de este mensaje y mándasela a Dani.");
   }
 }
 
@@ -2022,15 +2052,17 @@ async function saveEdits(){
     renderTeamAssign();
     setTimeout(() => setEditToolbarStatus(""), 2500);
   } catch(err){
+    console.error(err);
     const code = err && err.code;
+    const msg = (err && err.message) ? err.message : "error desconocido";
     if (code === "conflict"){
       setEditToolbarStatus("Alguien más editó a la vez — recarga la página para ver su versión.");
-    } else if (code === "not_writer"){
-      setEditToolbarStatus("No se pudo guardar (permiso rechazado). Avisa a Dani.");
+    } else if (code === "not_writer" || code === "unauthorized"){
+      setEditToolbarStatus("No se pudo guardar (permiso rechazado: " + msg + "). Avisa a Dani.");
     } else if (code === "rate_limited"){
       setEditToolbarStatus("Demasiados guardados seguidos — espera un momento.");
     } else {
-      setEditToolbarStatus("No se pudo guardar. Prueba de nuevo en unos segundos.");
+      setEditToolbarStatus("No se pudo guardar: " + msg);
     }
   }
 }
@@ -2067,6 +2099,13 @@ async function boot(){
 
   document.getElementById("edit-toolbar").hidden = false;
   document.querySelectorAll(".resp-select").forEach(sel => { sel.disabled = false; });
+
+  // Si ya la carga inicial falla (y no es simplemente "todavía no hay nada
+  // guardado"), se avisa aquí mismo — así no hace falta esperar a que
+  // alguien intente guardar algo para enterarse de que hay un problema.
+  if (STATE_LOAD_ERROR){
+    setEditToolbarStatus("⚠️ No se pudo conectar con GitHub (" + STATE_LOAD_ERROR + "). Los cambios no se están guardando.");
+  }
 }
 
 boot();
